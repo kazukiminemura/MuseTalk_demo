@@ -18,30 +18,25 @@ FFmpeg が PATH に入っている必要があります。
 動画を入力にする場合:
 
 ```powershell
-uv run python app.py `
-  --face-video path\to\face.mp4 `
-  --audio path\to\voice.wav `
-  --output runs\result.mp4
+uv run python app.py --face-video path\to\face.mp4 --audio path\to\voice.wav --output runs\result.mp4
 ```
 
 静止画を入力にする場合:
 
 ```powershell
-uv run python app.py `
-  --face-image path\to\face.png `
-  --audio path\to\voice.wav `
-  --output runs\result.mp4 `
-  --image-fps 25
+uv run python app.py --face-image path\to\face.png --audio path\to\voice.wav --output runs\result.mp4 --image-fps 25
 ```
 
 マイクから直接録音する場合:
 
 ```powershell
-uv run python app.py `
-  --face-video path\to\face.mp4 `
-  --mic `
-  --mic-duration 5 `
-  --output runs\result.mp4
+uv run python app.py --face-video path\to\face.mp4 --mic --mic-duration 5 --output runs\result.mp4
+```
+
+マイク音声を短く区切ってリアルタイム表示する場合:
+
+```powershell
+uv run python app.py --face-video path\to\face.mp4 --mic --realtime --mic-duration 0 --realtime-chunk-seconds 1.0
 ```
 
 Intel GPU / OpenVINO AUTO を使う場合:
@@ -58,6 +53,8 @@ uv run python app.py --face-video path\to\face.mp4 --audio path\to\voice.wav --d
 - `--mic`: マイクから録音して音声入力に使います
 - `--mic-duration`: マイク録音秒数
 - `--mic-device`: `sounddevice` の入力デバイス名または ID
+- `--realtime`: マイク音声を短いチャンクで処理して OpenCV ウィンドウに表示
+- `--realtime-chunk-seconds`: リアルタイム表示で使うマイク音声チャンク秒数
 - `--resize-factor`: 入力フレームを縮小して処理を軽くします
 - `--pad TOP BOTTOM LEFT RIGHT`: 検出した顔 bbox の余白
 - `--no-smooth`: 顔 bbox の平滑化を無効化

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import shutil
 import subprocess
 import sys
@@ -321,12 +322,10 @@ def record_microphone(duration: float, sample_rate: int, device: str | None, out
     return output_path
 
 
-def build_mel_chunks(audio_path: Path, fps: float, run_dir: Path) -> list[np.ndarray]:
+def build_mel_chunks_from_wav(wav: np.ndarray, fps: float) -> list[np.ndarray]:
     add_wav2lip_to_path()
     from Wav2Lip import audio
 
-    wav_path = extract_wav(audio_path, run_dir)
-    wav = audio.load_wav(str(wav_path), 16000)
     mel = audio.melspectrogram(wav)
     if np.isnan(mel.reshape(-1)).sum() > 0:
         raise RuntimeError("Mel spectrogram contains NaN values. Try a different audio file.")
@@ -342,6 +341,15 @@ def build_mel_chunks(audio_path: Path, fps: float, run_dir: Path) -> list[np.nda
         chunks.append(mel[:, start_idx : start_idx + MEL_STEP_SIZE])
         i += 1
     return chunks
+
+
+def build_mel_chunks(audio_path: Path, fps: float, run_dir: Path) -> list[np.ndarray]:
+    add_wav2lip_to_path()
+    from Wav2Lip import audio
+
+    wav_path = extract_wav(audio_path, run_dir)
+    wav = audio.load_wav(str(wav_path), 16000)
+    return build_mel_chunks_from_wav(wav, fps)
 
 
 def prepare_batch(img_batch, mel_batch, frame_batch, coords_batch):
@@ -377,6 +385,28 @@ def make_batches(
 
     if img_batch:
         yield prepare_batch(img_batch, mel_batch, frame_batch, coords_batch)
+
+
+def generate_lipsync_frames(
+    wav2lip_model: ov.CompiledModel,
+    frames: list[np.ndarray],
+    mel_chunks: list[np.ndarray],
+    face_results: list[tuple[np.ndarray, tuple[int, int, int, int]]],
+    batch_size: int,
+    static: bool,
+) -> Iterable[np.ndarray]:
+    batches = make_batches(frames, mel_chunks, face_results, batch_size, static)
+    for image_batch, mel_batch, frame_batch, coords_batch in batches:
+        image_batch = np.transpose(image_batch, (0, 3, 1, 2)).astype(np.float32)
+        mel_batch = np.transpose(mel_batch, (0, 3, 1, 2)).astype(np.float32)
+        predictions = wav2lip_model({"audio_sequences": mel_batch, "face_sequences": image_batch})[wav2lip_model.outputs[0]]
+        predictions = predictions.transpose(0, 2, 3, 1) * 255.0
+
+        for pred, frame, coords in zip(predictions, frame_batch, coords_batch):
+            y1, y2, x1, x2 = coords
+            pred = cv2.resize(pred.astype(np.uint8), (x2 - x1, y2 - y1))
+            frame[y1:y2, x1:x2] = pred
+            yield frame
 
 
 def run_wav2lip(
@@ -426,19 +456,9 @@ def run_wav2lip(
     temp_video = run_dir / "result.avi"
     writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"DIVX"), fps, (frame_w, frame_h))
 
-    batches = make_batches(frames, mel_chunks, face_results, batch_size, static)
-    total_batches = int(np.ceil(float(len(mel_chunks)) / batch_size))
-    for image_batch, mel_batch, frame_batch, coords_batch in tqdm(batches, total=total_batches, desc="Generating"):
-        image_batch = np.transpose(image_batch, (0, 3, 1, 2)).astype(np.float32)
-        mel_batch = np.transpose(mel_batch, (0, 3, 1, 2)).astype(np.float32)
-        predictions = wav2lip_model({"audio_sequences": mel_batch, "face_sequences": image_batch})[wav2lip_model.outputs[0]]
-        predictions = predictions.transpose(0, 2, 3, 1) * 255.0
-
-        for pred, frame, coords in zip(predictions, frame_batch, coords_batch):
-            y1, y2, x1, x2 = coords
-            pred = cv2.resize(pred.astype(np.uint8), (x2 - x1, y2 - y1))
-            frame[y1:y2, x1:x2] = pred
-            writer.write(frame)
+    generated_frames = generate_lipsync_frames(wav2lip_model, frames, mel_chunks, face_results, batch_size, static)
+    for frame in tqdm(generated_frames, total=len(mel_chunks), desc="Generating"):
+        writer.write(frame)
 
     writer.release()
     wav_path = extract_wav(audio_path, run_dir)
@@ -447,6 +467,119 @@ def run_wav2lip(
     print(f"Done in {time.time() - started_at:.1f}s")
     print(f"Output: {output_path}")
     return output_path
+
+
+def run_realtime_microphone(
+    face_video: Path | None,
+    face_image: Path | None,
+    device: str,
+    batch_size: int,
+    face_det_batch_size: int,
+    image_fps: float,
+    resize_factor: int,
+    rotate: bool,
+    pads: tuple[int, int, int, int],
+    smooth: bool,
+    mic_duration: float,
+    mic_sample_rate: int,
+    mic_device: str | None,
+    chunk_seconds: float,
+) -> None:
+    if chunk_seconds <= 0:
+        raise RuntimeError("--realtime-chunk-seconds must be greater than 0.")
+    if mic_sample_rate != 16000:
+        raise RuntimeError("Realtime mode currently requires --mic-sample-rate 16000.")
+
+    try:
+        import sounddevice as sd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("sounddevice is not installed. Run `uv sync` first.") from exc
+
+    ensure_openvino_models()
+
+    frames, fps, static = read_face_media(face_video, face_image, image_fps, resize_factor, rotate)
+    print(f"Frames: {len(frames)} at {fps:.2f} FPS")
+
+    core = ov.Core()
+    print(f"Compiling face detector on CPU: {FACE_DETECTION_MODEL}")
+    face_detector = core.compile_model(str(FACE_DETECTION_MODEL), "CPU")
+    face_source = [frames[0]] if static else frames
+    face_results = face_detect(face_detector, face_source, face_det_batch_size, pads, smooth)
+
+    print(f"Compiling Wav2Lip on {device}: {WAV2LIP_MODEL}")
+    wav2lip_model = core.compile_model(str(WAV2LIP_MODEL), device)
+
+    input_device: int | str | None = int(mic_device) if mic_device and mic_device.isdigit() else mic_device
+    audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
+    blocksize = max(1, int(mic_sample_rate * chunk_seconds))
+    max_chunks = None if mic_duration <= 0 else int(np.ceil(mic_duration / chunk_seconds))
+    window_name = "Wav2Lip realtime microphone"
+
+    def on_audio(indata, _frames, _time_info, status) -> None:
+        if status:
+            print(status, file=sys.stderr)
+        if audio_queue.full():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+        audio_queue.put(indata[:, 0].copy())
+
+    print("Starting realtime microphone preview. Press q in the preview window to stop.")
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    frame_offset = 0
+    processed_chunks = 0
+    started_at = time.time()
+
+    with sd.InputStream(
+        samplerate=mic_sample_rate,
+        channels=1,
+        dtype="float32",
+        blocksize=blocksize,
+        device=input_device,
+        callback=on_audio,
+    ):
+        while max_chunks is None or processed_chunks < max_chunks:
+            try:
+                samples = audio_queue.get(timeout=0.2)
+            except queue.Empty:
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
+            if len(samples) < blocksize:
+                samples = np.pad(samples, (0, blocksize - len(samples)))
+            mel_chunks = build_mel_chunks_from_wav(samples.astype(np.float32), fps)
+            if not mel_chunks:
+                continue
+
+            if static:
+                chunk_frames = frames * len(mel_chunks)
+                chunk_face_results = face_results * len(mel_chunks)
+            else:
+                indexes = [(frame_offset + i) % len(frames) for i in range(len(mel_chunks))]
+                chunk_frames = [frames[index] for index in indexes]
+                chunk_face_results = [face_results[index] for index in indexes]
+                frame_offset += len(mel_chunks)
+
+            target_delay_ms = max(1, int(1000 / fps))
+            for frame in generate_lipsync_frames(
+                wav2lip_model,
+                chunk_frames,
+                mel_chunks,
+                chunk_face_results,
+                batch_size,
+                static,
+            ):
+                cv2.imshow(window_name, frame)
+                if cv2.waitKey(target_delay_ms) & 0xFF == ord("q"):
+                    max_chunks = processed_chunks
+                    break
+
+            processed_chunks += 1
+
+    cv2.destroyWindow(window_name)
+    print(f"Realtime preview stopped after {time.time() - started_at:.1f}s.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -465,6 +598,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mic-duration", type=float, default=5.0, help="Microphone recording duration in seconds.")
     parser.add_argument("--mic-sample-rate", type=int, default=16000, help="Microphone recording sample rate.")
     parser.add_argument("--mic-device", default=None, help="Optional sounddevice input device name or id.")
+    parser.add_argument("--realtime", action="store_true", help="Preview microphone lip-sync in a realtime OpenCV window.")
+    parser.add_argument("--realtime-chunk-seconds", type=float, default=1.0, help="Microphone chunk size for realtime preview.")
     parser.add_argument("--resize-factor", type=int, default=1, help="Downscale input frames by this factor.")
     parser.add_argument("--rotate", action="store_true", help="Rotate input frames clockwise.")
     parser.add_argument("--pad", type=int, nargs=4, default=[0, 10, 0, 0], metavar=("TOP", "BOTTOM", "LEFT", "RIGHT"))
@@ -477,6 +612,29 @@ def main() -> int:
     args = parse_args()
     if args.setup_only:
         ensure_openvino_models()
+        return 0
+
+    if args.realtime:
+        if not args.mic:
+            raise SystemExit("--realtime requires --mic.")
+        if args.face_video is None and args.face_image is None:
+            raise SystemExit("--face-video or --face-image is required unless --setup-only is used.")
+        run_realtime_microphone(
+            face_video=args.face_video,
+            face_image=args.face_image,
+            device=args.device,
+            batch_size=args.batch_size,
+            face_det_batch_size=args.face_det_batch_size,
+            image_fps=args.image_fps,
+            resize_factor=args.resize_factor,
+            rotate=args.rotate,
+            pads=tuple(args.pad),
+            smooth=not args.no_smooth,
+            mic_duration=args.mic_duration,
+            mic_sample_rate=args.mic_sample_rate,
+            mic_device=args.mic_device,
+            chunk_seconds=args.realtime_chunk_seconds,
+        )
         return 0
 
     audio_path = args.audio
